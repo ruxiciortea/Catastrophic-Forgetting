@@ -15,24 +15,18 @@ class RecipeDataset(Dataset):
 
     def __getitem__(self, idx):
         input_text = (f"Does the following recipe have oven settings? "
-                      f"If yes, extract the oven settings as well as"
-                      f"the protein, browning and drying numerical values.\n"
+                      f"If yes, extract the oven settings as well as the protein, "
+                      f"browning and drying numerical values.\n"
                       f"Recipe title: {self.data['title'][idx]}.\n"
                       f"Recipe instructions: {self.data['instructions'][idx]}")
 
-        # if self.data['oven'][idx] == 'yes':
-        #     output_text = (f"Oven settings: Yes\nCooking parameters: {self.data['baking_steps'][idx]}\n"
-        #                    f"Classification values: {self.data['target_sentence'][idx]}")
-        # else:
-        #     output_text = "Oven settings: No"
         if self.data['oven'][idx] == 'yes':
-            output_text = (f"Oven settings: Yes\nCooking parameters: {self.data['baking_steps'][idx]}\n"
-                   f"Protein value: {self.data['protein'][idx]}\n"
-                   f"Browning value: {self.data['browning'][idx]}\n"
-                   f"Drying value: {self.data['drying'][idx]}\n"
-                   f"Classification values: {self.data['target_sentence'][idx]}")
+            output_text = (f"Oven settings: Yes; Cooking parameters: {self.data['baking_steps'][idx]}\n"
+                           f"Classification values: {self.data['target_sentence'][idx]}")
         else:
             output_text = "Oven settings: No"
+
+        recipe_id = self.data['recipe_id'][idx]
 
         source_encoding = self.tokenizer(
             input_text,
@@ -54,6 +48,7 @@ class RecipeDataset(Dataset):
         labels[labels == 0] = -100
 
         return {
+            'recipe_id': recipe_id,
             'input_ids': source_encoding['input_ids'].flatten(),
             'attention_mask': source_encoding['attention_mask'].flatten(),
             'labels': labels.flatten()
@@ -119,22 +114,25 @@ class MT5FineTuner(pl.LightningModule):
         return loss
 
     def test_step(self, batch, batch_idx):
+        recipe_ids = batch['recipe_id']
         input_ids = batch['input_ids']
         attention_mask = batch['attention_mask']
         labels = batch['labels']
-        loss, _ = self(input_ids, attention_mask, labels)
 
-        generated_ids = self.model.generate(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'], max_length=512, num_beams=2, early_stopping=True)
-        preds = [self.tokenizer.decode(i, skip_special_tokens=True, clean_up_tokenization_spaces=True)
-                 for i in generated_ids]
-        self.predictions.extend(preds)
+        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+        loss = outputs.loss
+        generated_ids = self.model.generate(input_ids=input_ids, attention_mask=attention_mask, max_length=512, num_beams=2, early_stopping=True)
+
+        preds = [self.tokenizer.decode(gen_id, skip_special_tokens=True, clean_up_tokenization_spaces=True)
+                 for gen_id in generated_ids]
+        self.predictions.extend(zip(recipe_ids.tolist(), preds))
 
         self.log('test_loss', loss, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
         return {'test_loss': loss}
 
     def on_test_epoch_end(self):
-        pd.DataFrame(self.predictions, columns=['predictions']).to_csv('/out/test_predictions.csv',
-                                                                       index=False)
+        prediction_df = pd.DataFrame(self.predictions, columns=['recipe_id', 'predicted_baking_steps'])
+        prediction_df.to_csv('/out/predictions/test_predictions_with_ids.csv', index=False)
         self.predictions = []
 
     def configure_optimizers(self):
@@ -147,11 +145,11 @@ class MT5FineTuner(pl.LightningModule):
 
 def train_model():
     model_name = 'google/mt5-small'
-    batch_size = 4
+    batch_size = 8
     number_of_epochs = 2
     learning_rate = 3e-4
 
-    tokenizer = MT5Tokenizer.from_pretrained(model_name)
+    tokenizer = MT5Tokenizer.from_pretrained('google/mt5-small')
 
     data_module = RecipeDataModule(
         train_file='/dataset/train_set.csv',
@@ -171,6 +169,7 @@ def train_model():
         max_epochs=number_of_epochs,
         devices="auto",
         accelerator="auto",
+        strategy='ddp',
         logger=True,
         callbacks=[
             ModelCheckpoint(
@@ -188,3 +187,9 @@ def train_model():
 
 if __name__ == '__main__':
     train_model()
+
+    test_df = pd.read_csv('/dataset/test_set.csv')
+    predictions_df = pd.read_csv('/out/predictions/test_predictions_with_ids.csv')
+    merged_df = test_df.merge(predictions_df, on='recipe_id', how='left')
+    merged_df.to_csv('/out/predictions/test_data_with_predictions.csv', index=False)
+
