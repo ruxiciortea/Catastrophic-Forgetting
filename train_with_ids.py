@@ -27,8 +27,6 @@ class RecipeDataset(Dataset):
         else:
             output_text = "Oven settings: No"
 
-        recipe_id = self.data['recipe_id'][idx]
-
         source_encoding = self.tokenizer(
             input_text,
             padding='max_length',
@@ -45,13 +43,11 @@ class RecipeDataset(Dataset):
             return_tensors="pt"
         )
 
-        labels = target_encoding['input_ids']
-
         return {
-            'recipe_id': recipe_id,
+            'recipe_id': self.data['recipe_id'][idx],
             'input_ids': source_encoding['input_ids'].flatten(),
             'attention_mask': source_encoding['attention_mask'].flatten(),
-            'labels': labels.flatten()
+            'labels': target_encoding['input_ids'].flatten()
         }
 
 class RecipeDataModule(pl.LightningDataModule):
@@ -136,7 +132,7 @@ def train_model():
 
     trainer = Trainer(
         max_epochs=number_of_epochs,
-        devices='4',
+        devices='auto',
         accelerator='gpu',
         strategy='ddp',
         logger=True,

@@ -2,7 +2,7 @@ import pandas as pd
 import pytorch_lightning as pl
 
 from torch.utils.data import DataLoader, Dataset
-from transformers import T5Tokenizer, MT5ForConditionalGeneration, Adafactor
+from transformers import T5Tokenizer, MT5ForConditionalGeneration
 from pytorch_lightning import Trainer
 
 class RecipeDataset(Dataset):
@@ -26,8 +26,6 @@ class RecipeDataset(Dataset):
         else:
             output_text = "Oven settings: No"
 
-        recipe_id = self.data['recipe_id'][idx]
-
         source_encoding = self.tokenizer(
             input_text,
             padding='max_length',
@@ -44,13 +42,11 @@ class RecipeDataset(Dataset):
             return_tensors="pt"
         )
 
-        labels = target_encoding['input_ids']
-
         return {
-            'recipe_id': recipe_id,
+            'recipe_id': self.data['recipe_id'][idx],
             'input_ids': source_encoding['input_ids'].flatten(),
             'attention_mask': source_encoding['attention_mask'].flatten(),
-            'labels': labels.flatten()
+            'labels': target_encoding['input_ids'].flatten()
         }
 
 class RecipeDataModule(pl.LightningDataModule):
@@ -83,24 +79,20 @@ class MT5FineTuner(pl.LightningModule):
         labels = batch['labels']
 
         outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-        loss = outputs.loss
         generated_ids = self.model.generate(input_ids=input_ids, attention_mask=attention_mask, max_length=512, num_beams=2, early_stopping=True)
 
         preds = [self.tokenizer.decode(gen_id, skip_special_tokens=True, clean_up_tokenization_spaces=True)
                  for gen_id in generated_ids]
         self.predictions.extend(zip(recipe_ids.tolist(), preds))
-
-        self.log('test_loss', loss, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-        return {'test_loss': loss}
-
-    def on_test_epoch_end(self):
         prediction_df = pd.DataFrame(self.predictions, columns=['recipe_id', 'predicted_baking_steps'])
         prediction_df.to_csv('/out/predictions/test_predictions_with_ids_small.csv', index=False)
-        self.predictions = []
+
+        self.log('test_loss', outputs.loss, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        return {'test_loss': outputs.loss}        
 
 def train_model():
-    model_name = 'google/mt5-small'
-    checkpoint_path = '/out/models/epoch=4-step=12975.ckpt'
+    model_name = 'google/mt5-base'
+    checkpoint_path = '/out/models/epoch=5-step=15570-v1.ckpt'
     batch_size = 8
     number_of_epochs = 6
     learning_rate = 3e-4
@@ -116,7 +108,7 @@ def train_model():
 
     trainer = Trainer(
         max_epochs=number_of_epochs,
-        devices='1',
+        devices='auto',
         accelerator='gpu'
     )
 
