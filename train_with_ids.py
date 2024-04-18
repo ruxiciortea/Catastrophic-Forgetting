@@ -55,7 +55,7 @@ class RecipeDataset(Dataset):
         }
 
 class RecipeDataModule(pl.LightningDataModule):
-    def __init__(self, train_file, val_file, test_file, tokenizer, batch_size):
+    def __init__(self, train_file, val_file, tokenizer, batch_size):
         super().__init__()
         self.train_dataset = None
         self.val_dataset = None
@@ -118,7 +118,7 @@ class MT5FineTuner(pl.LightningModule):
 def train_model():
     model_name = 'google/mt5-small'
     batch_size = 8
-    number_of_epochs = 6
+    number_of_epochs = 8
     learning_rate = 3e-4
 
     tokenizer = T5Tokenizer.from_pretrained(

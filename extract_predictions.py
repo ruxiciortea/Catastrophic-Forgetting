@@ -4,7 +4,6 @@ import pytorch_lightning as pl
 from torch.utils.data import DataLoader, Dataset
 from transformers import T5Tokenizer, MT5ForConditionalGeneration, Adafactor
 from pytorch_lightning import Trainer
-from pytorch_lightning.callbacks import ModelCheckpoint
 
 class RecipeDataset(Dataset):
     def __init__(self, tokenizer, data_file):
@@ -29,7 +28,7 @@ class RecipeDataset(Dataset):
 
         recipe_id = self.data['recipe_id'][idx]
 
-        source_encoding = self.tokenizer.batch_encode_plus(
+        source_encoding = self.tokenizer(
             input_text,
             padding='max_length',
             max_length=512,
@@ -37,7 +36,7 @@ class RecipeDataset(Dataset):
             return_tensors="pt"
         )
 
-        target_encoding = self.tokenizer.batch_encode_plus(
+        target_encoding = self.tokenizer(
             output_text,
             padding='max_length',
             max_length=512,
@@ -69,9 +68,9 @@ class RecipeDataModule(pl.LightningDataModule):
         return DataLoader(self.test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=15)
 
 class MT5FineTuner(pl.LightningModule):
-    def __init__(self, model_name, tokenizer, learning_rate):
+    def __init__(self, model_path, tokenizer, learning_rate):
         super().__init__()
-        self.model = MT5ForConditionalGeneration.from_pretrained(model_name, return_dict=True)
+        self.model = MT5ForConditionalGeneration.from_pretrained(model_path, return_dict=True)
         self.tokenizer = tokenizer
         self.learning_rate = learning_rate
         self.predictions = []
@@ -95,21 +94,13 @@ class MT5FineTuner(pl.LightningModule):
         return {'test_loss': loss}
 
     def on_test_epoch_end(self):
-        current_epoch = self.current_epoch
         prediction_df = pd.DataFrame(self.predictions, columns=['recipe_id', 'predicted_baking_steps'])
-        prediction_df.to_csv(f'/out/predictions/test_predictions_with_ids_batch8_epoch{current_epoch}.csv', index=False)
+        prediction_df.to_csv('/out/predictions/test_predictions_with_ids_small.csv', index=False)
         self.predictions = []
 
-    def configure_optimizers(self):
-        return Adafactor(
-            self.parameters(),
-            lr=self.learning_rate,
-            scale_parameter=False,
-            relative_step=False
-        )
-
 def train_model():
-    model_name = 'google/mt5-base'
+    model_name = 'google/mt5-small'
+    checkpoint_path = '/out/models/epoch=4-step=12975.ckpt'
     batch_size = 8
     number_of_epochs = 6
     learning_rate = 3e-4
@@ -121,15 +112,11 @@ def train_model():
         truncation=True,
     )
 
-    model = MT5FineTuner(
-        model_name=model_name,
-        tokenizer=tokenizer,
-        learning_rate=learning_rate
-    )
+    model = MT5FineTuner.load_from_checkpoint(checkpoint_path=checkpoint_path, model_path=model_name, lr=learning_rate, train_len=0, epochs=number_of_epochs)
 
     trainer = Trainer(
         max_epochs=number_of_epochs,
-        devices='4',
+        devices='1',
         accelerator='gpu'
     )
 
@@ -143,14 +130,3 @@ def train_model():
 
 if __name__ == '__main__':
     train_model()
-
-# model = MT5FineTuner.load_from_checkpoint(checkpoint_path=f"{location}/{ckpt_name}", model_path=MODEL_PATH, lr=LR, train_len=0, epochs=EPOCHS)
-#     trainer = pl.Trainer(
-#         devices=1,
-#         accelerator='gpu',
-#         default_root_dir='/VOITA/out/t5/',
-#         inference_mode=False
-#     )
-#     outputs = trainer.predict(model, test_dataloader)
-
-# tokenizer = T5Tokenizer.from_pretrained(model_name)
