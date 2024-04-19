@@ -2,7 +2,7 @@ import pandas as pd
 import pytorch_lightning as pl
 
 from torch.utils.data import DataLoader, Dataset
-from transformers import T5Tokenizer, MT5ForConditionalGeneration, Adafactor
+from transformers import T5Tokenizer, MT5ForConditionalGeneration, AdamW
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint
 
@@ -27,21 +27,8 @@ class RecipeDataset(Dataset):
         else:
             output_text = "Oven settings: No"
 
-        source_encoding = self.tokenizer(
-            input_text,
-            padding='max_length',
-            max_length=512,
-            truncation=True,
-            return_tensors="pt"
-        )
-
-        target_encoding = self.tokenizer(
-            output_text,
-            padding='max_length',
-            max_length=512,
-            truncation=True,
-            return_tensors="pt"
-        )
+        source_encoding = self.tokenizer(input_text, padding='max_length', max_length=512, truncation=True, return_tensors="pt")
+        target_encoding = self.tokenizer(output_text, padding='max_length', max_length=512, truncation=True, return_tensors="pt")
 
         return {
             'recipe_id': self.data['recipe_id'][idx],
@@ -76,65 +63,43 @@ class MT5FineTuner(pl.LightningModule):
         self.model = MT5ForConditionalGeneration.from_pretrained(model_name, return_dict=True)
         self.tokenizer = tokenizer
         self.learning_rate = learning_rate
-        self.predictions = []
         self.save_hyperparameters()
 
     def forward(self, input_ids, attention_mask, labels=None):
-        output = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels
-        )
-        return output.loss, output.logits
+        return self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
 
-    def training_step(self, batch, batch_idx):
+    def training_step(self, batch):
         input_ids = batch['input_ids']
         attention_mask = batch['attention_mask']
         labels = batch['labels']
-        loss, _ = self(input_ids, attention_mask, labels)
-        self.log('train_loss', loss, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-        return loss
+        output = self(input_ids, attention_mask, labels)
+        self.log('train_loss', output.loss, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        return output.loss
 
-    def validation_step(self, batch, batch_idx):
+    def validation_step(self, batch):
         input_ids = batch['input_ids']
         attention_mask = batch['attention_mask']
         labels = batch['labels']
-        loss, _ = self(input_ids, attention_mask, labels)
-        self.log('val_loss', loss, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-        return loss
+        output = self(input_ids, attention_mask, labels)
+        self.log('val_loss', output.loss, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        return output.loss
 
     def configure_optimizers(self):
-        return Adafactor(
-            self.parameters(),
-            lr=self.learning_rate,
-            scale_parameter=False,
-            relative_step=False
-        )
+        return AdamW(self.parameters(), lr=self.learning_rate)
 
 def train_model():
-    model_name = 'google/mt5-small'
-    batch_size = 8
-    number_of_epochs = 8
+    model_name = 'google/mt5-base'
+    batch_size = 4
+    epochs = 8
     learning_rate = 3e-4
 
-    tokenizer = T5Tokenizer.from_pretrained(
-        model_name,
-        max_length=512,
-        padding="max_length",
-        truncation=True,
-    )
-
-    model = MT5FineTuner(
-        model_name=model_name,
-        tokenizer=tokenizer,
-        learning_rate=learning_rate
-    )
+    tokenizer = T5Tokenizer.from_pretrained(model_name, max_length=512, padding="max_length", truncation=True)
+    model = MT5FineTuner(model_name=model_name, tokenizer=tokenizer, learning_rate=learning_rate)
 
     trainer = Trainer(
-        max_epochs=number_of_epochs,
+        max_epochs=epochs,
         devices='auto',
         accelerator='gpu',
-        strategy='ddp',
         logger=True,
         callbacks=[
             ModelCheckpoint(

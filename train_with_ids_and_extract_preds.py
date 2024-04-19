@@ -2,7 +2,7 @@ import pandas as pd
 import pytorch_lightning as pl
 
 from torch.utils.data import DataLoader, Dataset
-from transformers import T5Tokenizer, MT5ForConditionalGeneration, Adafactor
+from transformers import T5Tokenizer, MT5ForConditionalGeneration, AdamW
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint
 
@@ -27,21 +27,8 @@ class RecipeDataset(Dataset):
         else:
             output_text = "Oven settings: No"
 
-        source_encoding = self.tokenizer(
-            input_text,
-            padding='max_length',
-            max_length=512,
-            truncation=True,
-            return_tensors="pt"
-        )
-
-        target_encoding = self.tokenizer(
-            output_text,
-            padding='max_length',
-            max_length=512,
-            truncation=True,
-            return_tensors="pt"
-        )
+        source_encoding = self.tokenizer(input_text, padding='max_length', max_length=512, truncation=True)
+        target_encoding = self.tokenizer(output_text, padding='max_length', max_length=512, truncation=True)
 
         return {
             'recipe_id': self.data['recipe_id'][idx],
@@ -82,63 +69,47 @@ class MT5FineTuner(pl.LightningModule):
         self.model = MT5ForConditionalGeneration.from_pretrained(model_name, return_dict=True)
         self.tokenizer = tokenizer
         self.learning_rate = learning_rate
-        self.predictions = []
         self.save_hyperparameters()
 
     def forward(self, input_ids, attention_mask, labels=None):
-        output = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels
-        )
-        return output.loss, output.logits
+        return self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
 
-    def training_step(self, batch, batch_idx):
+    def training_step(self, batch):
         input_ids = batch['input_ids']
         attention_mask = batch['attention_mask']
         labels = batch['labels']
-        loss, _ = self(input_ids, attention_mask, labels)
-        self.log('train_loss', loss, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-        return loss
+        output = self(input_ids, attention_mask, labels)
+        self.log('train_loss', output.loss, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        return output.loss
 
-    def validation_step(self, batch, batch_idx):
+    def validation_step(self, batch):
         input_ids = batch['input_ids']
         attention_mask = batch['attention_mask']
         labels = batch['labels']
-        loss, _ = self(input_ids, attention_mask, labels)
-        self.log('val_loss', loss, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-        return loss
+        output = self(input_ids, attention_mask, labels)
+        self.log('val_loss', output.loss, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        return output.loss
 
-    def test_step(self, batch, batch_idx):
+    def test_step(self, batch):
         recipe_ids = batch['recipe_id']
         input_ids = batch['input_ids']
         attention_mask = batch['attention_mask']
         labels = batch['labels']
 
         outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-        loss = outputs.loss
-        generated_ids = self.model.generate(input_ids=input_ids, attention_mask=attention_mask, max_length=512, num_beams=2, early_stopping=True)
+        generated_items = self.model.generate(input_ids=input_ids, attention_mask=attention_mask, max_length=512, num_beams=2, early_stopping=True)
 
-        preds = [self.tokenizer.decode(gen_id, skip_special_tokens=True, clean_up_tokenization_spaces=True)
-                 for gen_id in generated_ids]
+        preds = [self.tokenizer.decode(item, skip_special_tokens=True, clean_up_tokenization_spaces=True)
+                 for item in generated_items]
         self.predictions.extend(zip(recipe_ids.tolist(), preds))
-
-        self.log('test_loss', loss, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-        return {'test_loss': loss}
-
-    def on_test_epoch_end(self):
-        current_epoch = self.current_epoch
         prediction_df = pd.DataFrame(self.predictions, columns=['recipe_id', 'predicted_baking_steps'])
-        prediction_df.to_csv(f'/out/predictions/test_predictions_with_ids_batch8_epoch{current_epoch}.csv', index=False)
-        self.predictions = []
+        prediction_df.to_csv('/out/predictions/test_predictions_with_ids_small.csv', index=False)
+
+        self.log('test_loss', outputs.loss, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        return {'test_loss': outputs.loss} 
 
     def configure_optimizers(self):
-        return Adafactor(
-            self.parameters(),
-            lr=self.learning_rate,
-            scale_parameter=False,
-            relative_step=False
-        )
+        return AdamW(self.parameters(), lr=self.learning_rate)
 
 def train_model():
     model_name = 'google/mt5-small'
@@ -146,24 +117,13 @@ def train_model():
     number_of_epochs = 3
     learning_rate = 3e-4
 
-    tokenizer = T5Tokenizer.from_pretrained(
-        model_name,
-        max_length=512,
-        padding="max_length",
-        truncation=True,
-    )
-
-    model = MT5FineTuner(
-        model_name=model_name,
-        tokenizer=tokenizer,
-        learning_rate=learning_rate
-    )
+    tokenizer = T5Tokenizer.from_pretrained(model_name, max_length=512, padding="max_length", truncation=True)
+    model = MT5FineTuner(model_name=model_name, tokenizer=tokenizer, learning_rate=learning_rate)
 
     trainer = Trainer(
         max_epochs=number_of_epochs,
         devices='auto',
         accelerator='gpu',
-        strategy='ddp',
         logger=True,
         callbacks=[
             ModelCheckpoint(
