@@ -1,114 +1,66 @@
 import pandas as pd
 import pytorch_lightning as pl
 
-from torch.utils.data import DataLoader, Dataset
 from transformers import T5Tokenizer, MT5ForConditionalGeneration, AdamW
-from pytorch_lightning import Trainer
+from pytorch_lightning import Trainer 
+from data_load import load_data
 
-class RecipeDataset(Dataset):
-    def __init__(self, tokenizer, data_file):
-        self.tokenizer = tokenizer
-        self.data = pd.read_csv(data_file)
+MODEL_PATH = 'google/mt5-base'
+CHECKPOINT_PATH = '/out/models/base_all_epoch_6_batch_4_lr_1e.ckpt'
+BATCH_SIZE = 4
+EPOCHS = 1
+LEARNING_RATE = 1e-4
+MAX_SEQUENCE_LENGTH = 512
 
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        input_text = (f"Does the following recipe have oven settings? "
-                      f"If yes, extract the oven settings as well as the protein, "
-                      f"browning and drying numerical values.\n"
-                      f"Recipe title: {self.data['title'][idx]}.\n"
-                      f"Recipe instructions: {self.data['instructions'][idx]}")
-
-        if self.data['oven'][idx] == 'yes':
-            output_text = (f"Oven settings: Yes; Cooking parameters: {self.data['baking_steps'][idx]}\n"
-                           f"Classification values: {self.data['target_sentence'][idx]}")
-        else:
-            output_text = "Oven settings: No"
-
-        source_encoding = self.tokenizer(
-            input_text,
-            padding='max_length',
-            max_length=512,
-            truncation=True,
-            return_tensors="pt"
-        )
-
-        target_encoding = self.tokenizer(
-            output_text,
-            padding='max_length',
-            max_length=512,
-            truncation=True,
-            return_tensors="pt"
-        )
-
-        return {
-            'recipe_id': self.data['recipe_id'][idx],
-            'input_ids': source_encoding['input_ids'].flatten(),
-            'attention_mask': source_encoding['attention_mask'].flatten(),
-            'labels': target_encoding['input_ids'].flatten()
-        }
-
-class RecipeDataModule(pl.LightningDataModule):
-    def __init__(self, test_file, tokenizer, batch_size):
-        super().__init__()
-        self.test_dataset = None
-        self.test_file = test_file
-        self.tokenizer = tokenizer
-        self.batch_size = batch_size
-
-    def setup(self, stage):
-        self.test_dataset = RecipeDataset(self.tokenizer, self.test_file)
-
-    def test_dataloader(self):
-        return DataLoader(self.test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=15)
-
-class MT5FineTuner(pl.LightningModule):
+class MT5Classifier(pl.LightningModule):
     def __init__(self, model_path, tokenizer, learning_rate):
         super().__init__()
         self.model = MT5ForConditionalGeneration.from_pretrained(model_path, return_dict=True)
         self.tokenizer = tokenizer
         self.learning_rate = learning_rate
-        self.predictions = []
         self.save_hyperparameters()
+        self.predictions = []
 
     def forward(self, input_ids, attention_mask, labels=None):
-        return self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+        output = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+        return output.loss
 
     def test_step(self, batch):
-        recipe_ids = batch['recipe_id']
         input_ids = batch['input_ids']
         attention_mask = batch['attention_mask']
         labels = batch['labels']
 
-        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-        generated_items = self.model.generate(input_ids=input_ids, attention_mask=attention_mask, max_length=512, num_beams=2, early_stopping=True)
-
-        preds = [self.tokenizer.decode(item, skip_special_tokens=True, clean_up_tokenization_spaces=True)
-                 for item in generated_items]
-        self.predictions.extend(zip(recipe_ids.tolist(), preds))
-        prediction_df = pd.DataFrame(self.predictions, columns=['recipe_id', 'predicted_baking_steps'])
-        prediction_df.to_csv('/out/predictions/test_predictions_with_ids_small.csv', index=False)
-
-        self.log('test_loss', outputs.loss, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-        return {'test_loss': outputs.loss}  
+        output = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+        self.log('test_loss', output.loss, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        return output.loss
     
+    def predict_step(self, batch):
+        input_ids = batch['input_ids']
+        attention_mask = batch['attention_mask']
+
+        generated_items = self.model.generate(input_ids=input_ids, attention_mask=attention_mask, max_length=MAX_SEQUENCE_LENGTH, num_beams=2)
+        generated_predicitons = [self.tokenizer.decode(item, skip_special_tokens=True, clean_up_tokenization_spaces=True) for item in generated_items]
+        self.predictions.extend(generated_predicitons)
+
+        return self.predictions  
+    
+    def on_predict_epoch_end(self):
+        prediction_df = pd.DataFrame(self.predictions, columns=['predicted_browning_value'])
+        prediction_df.to_csv('/out/predictions/predictions_all_tasks.csv', index=False)
+
     def configure_optimizers(self):
-        return AdamW(self.parameters(), lr=self.learning_rate)      
+        return AdamW(self.parameters(), lr=self.learning_rate)   
 
-def train_model():
-    model_name = 'google/mt5-base'
-    checkpoint_path = '/out/models/epoch=5-step=15570-v1.ckpt'
-    batch_size = 8
-    number_of_epochs = 6
-    learning_rate = 3e-4
+def extract_predictions():
+    tokenizer = T5Tokenizer.from_pretrained(MODEL_PATH, max_length=MAX_SEQUENCE_LENGTH, padding="max_length", truncation=True)
+    model = MT5Classifier.load_from_checkpoint(checkpoint_path=CHECKPOINT_PATH, model_path=MODEL_PATH, lr=LEARNING_RATE, train_len=0, epochs=EPOCHS)
+    trainer = Trainer(accelerator='gpu', devices='auto', max_epochs=EPOCHS, logger=True)
 
-    tokenizer = T5Tokenizer.from_pretrained(model_name, max_length=512, padding="max_length", truncation=True)
-    model = MT5FineTuner.load_from_checkpoint(checkpoint_path=checkpoint_path, model_path=model_name, lr=learning_rate, train_len=0, epochs=number_of_epochs)
-    trainer = Trainer(max_epochs=number_of_epochs, devices='auto', accelerator='gpu')
-    data_module = RecipeDataModule(test_file='/dataset/test_set.csv', tokenizer=tokenizer, batch_size=batch_size)
+    data_path = '/dataset/predict_set.csv'
+    dataloader = load_data(tokenizer=tokenizer, data_path=data_path, batch_size=BATCH_SIZE, shuffle=False)
 
-    trainer.test(model, data_module)
+    trainer.test(model, dataloader)
+    trainer.predict(model, dataloader)
 
 if __name__ == '__main__':
-    train_model()
+    extract_predictions()
